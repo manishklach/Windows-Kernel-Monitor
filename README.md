@@ -1,155 +1,121 @@
 # Windows Kernel Monitor (Admin-Friendly) — Native Python
 
-A **single-file**, **no-GUI** Windows performance monitor that prints a high-signal terminal dashboard with **CPU**, **memory pressure**, **pagefile**, **kernel memory**, and **top process** stats. Designed to be **robust on real Windows boxes** (including mixed PDH availability) and **safe to run continuously**.
+A **single-file**, **no-GUI** Windows performance monitor that prints a high-signal terminal dashboard with **CPU**, **memory pressure**, **paging health**, **pagefile**, **kernel memory**, and **top process** stats.
 
 > **Run as Administrator (recommended / some environments).**  
 > Some counters and process details may be limited without elevated privileges.
 
 ---
 
-## Features
+## What’s new (v14)
 
-### CPU
-- **Overall CPU utilization** (%)
-- **Per-core utilization** (%)
-- **CPU frequency**
-  - Average current frequency across cores (from `psutil`)
-  - Per-core current/max frequency and % of max (when available)
-
-### Memory pressure (PDH)
-- **Page Faults/sec** (`\Memory\Page Faults/sec`)
-- **Pages/sec** (`\Memory\Pages/sec`)
-- **Page Reads/sec** (`\Memory\Page Reads/sec`)
-- **Compressed Page Size** (`\Memory\Compressed Page Size`)  
-  (Windows Memory Compression footprint, shown as bytes/MB/GB)
-
-### Memory availability & pagefile (PDH)
-- **Memory\Available Bytes** (`\Memory\Available Bytes`)
-- **Paging File(_Total)\% Usage** (resolved via wildcard expansion when needed)
-
-### Deep kernel/system memory (GetPerformanceInfo)
-- **Physical Total / Available**
-- **Commit Total / Commit Limit**
-- **Kernel Paged** (swappable)
-- **Kernel Non-Paged** (resident)
-
-### Swap / pagefile (psutil)
-- **Swap Total / Used / Free / %** (Windows pagefile exposure via `psutil.swap_memory()`)
-
-### Top processes
-- **Top by CPU%** (last ~1s window)
-- **Top by RSS (Working Set)** with % of system memory
-
-### System totals
-- **Handles**, **Processes**, **Threads** (from `GetPerformanceInfo`)
+- **EMA smoothing (10s)** for key memory pressure counters:
+  - Page Faults/sec, Pages/sec, Page Reads/sec
+- **Paging Health line** with:
+  - `HardFaultPressure: OK/WARN/HOT` (heuristic label)
+  - `Index: 0–100` (monotonic “hard-fault pressure” indicator)
+- **Compressed memory robustness**
+  - Tries several PDH compressed-bytes counters
+  - Falls back to **MemCompression RSS** (working set) if PDH counter isn’t available
 
 ---
 
-## Screenshot
+## Features
 
-The dashboard is a terminal output updated about once per second, e.g.:
+### CPU
+- Overall CPU utilization (%)
+- Per-core utilization (%)
+- CPU frequency (avg + per-core current/max when available)
 
-- CPU bars (overall + per-core)
-- Memory pressure counters (page faults/pages/page reads)
-- Memory compression size
-- Paging file usage + available bytes
-- Deep kernel memory + swap/pagefile details
-- Top processes by CPU + memory
+### Memory pressure (PDH)
+- **Page Faults/sec**
+- **Pages/sec**
+- **Page Reads/sec**
+- Each shown as: **instant** + **EMA10** (10-second exponential moving average)
+
+### Paging health (derived)
+A quick interpretation layer for “are we actually paging to disk?”:
+
+- **HardFaultPressure**:
+  - `OK` — low disk-backed paging
+  - `WARN` — noticeable paging I/O
+  - `HOT` — sustained high paging I/O
+- **Index (0–100)**:
+  - dominated by Page Reads/sec, with a smaller contribution from Pages/sec
+
+> This is a heuristic meant to be **useful**, not “scientific”.
+
+### Memory compression (PDH + fallback)
+- If available: PDH compressed-bytes counter
+- Otherwise: **MemCompression process RSS** shown as:
+  - `Compressed: X (MemCompression RSS)`
+
+### Memory availability & pagefile (PDH)
+- Memory\\Available Bytes
+- Paging File(*)\\% Usage (instance resolved via wildcard expansion, prefers `_Total`)
+
+### Deep kernel/system memory (GetPerformanceInfo)
+- Physical Total / Available
+- Commit Total / Commit Limit
+- Kernel Paged / Kernel Non-Paged
+- Handles / Processes / Threads
+
+### Swap / pagefile (psutil)
+- Swap Total / Used / Free / %
+
+### Top processes
+- Top by CPU% (last ~1s)
+- Top by RSS (working set) + % of system memory
 
 ---
 
 ## Requirements
 
-- **Windows 10/11**
-- **Python 3.9+** recommended (3.8+ usually OK)
+- Windows 10/11
+- Python 3.9+ recommended (3.8+ usually OK)
 - `psutil` (only external dependency)
 
-> PDH is part of Windows. The script uses `ctypes` to call PDH + kernel APIs directly.
-
 ---
 
-## Installation
+## Install
 
-### Option A — pip install dependency
 ```powershell
-python -m pip install --upgrade pip
-python -m pip install psutil
-```
-
-### Option B — venv (recommended)
-```powershell
-python -m venv .venv
-. .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install psutil
 ```
 
 ---
 
-## Usage
+## Run
 
-### Run (recommended: elevated shell)
 Open **PowerShell as Administrator** (recommended / some environments) and run:
 
 ```powershell
-python .\native_win_monitor_v12.py
+python .\native_win_monitor_v14.py
 ```
 
-Stop with:
-- `Ctrl + C`
+Stop: `Ctrl + C`
 
 ---
 
-## Troubleshooting
+## Debug PDH counters
 
-### 1) Some values show `n/a`
-That usually means:
-- A PDH counter could not be bound on this system, or
-- You are not running with enough privileges, or
-- That metric is not exposed by your Windows build / perf counter set.
-
-Try running as Administrator and/or enable PDH debug:
+If some PDH values show `n/a`:
 
 ```powershell
 $env:DEBUG_PDH="1"
-python .\native_win_monitor_v12.py
+python .\native_win_monitor_v14.py
 ```
 
-This prints which exact PDH counter paths were chosen and PDH status codes.
-
-### 2) PDH counter path quirks
-Different Windows builds sometimes require the machine-qualified path:
-- `\\COMPUTERNAME\Memory\Page Faults/sec`
-
-The script automatically tries both local and machine-qualified forms when applicable.
-
-### 3) Per-core CPU frequency shows `n/a` for some cores
-On some systems (especially hybrid CPU topologies / driver combinations), Windows or `psutil` may not expose per-core frequency for every logical core. The monitor will still show overall CPU utilization correctly.
-
----
-
-## What each metric means (quick guide)
-
-- **Page Faults/sec**: total page faults (soft + hard) per second. Spikes can be normal; sustained high values may indicate memory pressure or heavy paging activity.
-- **Pages/sec**: pages read/written to resolve hard faults; often correlates with paging I/O pressure.
-- **Page Reads/sec**: reads from disk to resolve hard faults (more directly I/O-related).
-- **Compressed Page Size**: amount of memory occupied by Windows’ memory compression store.
-- **Available Bytes**: immediately available physical memory for allocation.
-- **Paging File % Usage**: percent usage of the pagefile (instance resolved to `_Total` if present).
-- **Commit Total / Limit**: committed virtual memory vs commit limit (RAM + pagefile).
-- **Kernel Paged / Non-Paged**: kernel memory that can/cannot be paged out.
-
----
-
-## Files
-
-- `native_win_monitor_v12.py` — main monitor script
+This prints:
+- which exact PDH counter paths were chosen
+- PDH status codes for reads
 
 ---
 
 ## License
 
-MIT License
+MIT License (see below)
 
 Copyright (c) 2026
 

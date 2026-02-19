@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import os
 from typing import Optional, Dict, List, Tuple
+import math
 
 ULONG_PTR = getattr(wintypes, "ULONG_PTR", ctypes.c_void_p)
 DEBUG_PDH = os.environ.get("DEBUG_PDH", "").strip().lower() in ("1", "true", "yes")
@@ -50,10 +51,11 @@ class PdhCounters:
     """
     Robust PDH wrapper.
 
-    FIXES:
-      - avoids ctypes argtypes clobbering (PdhGetFormattedCounterValue is ONE function; we use a generic signature)
-      - tries both local and machine-qualified paths (\\\\COMPUTER\\Object\\Counter)
-      - wildcard expand Paging File(*)% Usage and prefer _Total if present
+    Notes:
+      - PdhGetFormattedCounterValue is ONE function; we use a generic signature (last arg void*)
+      - Tries both local and machine-qualified paths (\\\\COMPUTER\\Object\\Counter)
+      - Wildcard expands Paging File(*)% Usage and prefers _Total if present
+      - Compressed memory counters vary across Windows builds; we try several names.
     """
     def __init__(self):
         self._ok = False
@@ -75,12 +77,10 @@ class PdhCounters:
         except Exception:
             return
 
-        # Open query
         self._open = self._pdh.PdhOpenQueryW
         self._open.argtypes = [wintypes.LPCWSTR, ULONG_PTR, ctypes.POINTER(wintypes.HANDLE)]
         self._open.restype = wintypes.DWORD
 
-        # Add counter (prefer English if available)
         add_eng = getattr(self._pdh, "PdhAddEnglishCounterW", None)
         add_std = getattr(self._pdh, "PdhAddCounterW", None)
         if add_eng is None and add_std is None:
@@ -90,17 +90,14 @@ class PdhCounters:
         self._add.restype = wintypes.DWORD
         self._using_english = add_eng is not None
 
-        # Collect data
         self._collect = self._pdh.PdhCollectQueryData
         self._collect.argtypes = [wintypes.HANDLE]
         self._collect.restype = wintypes.DWORD
 
-        # IMPORTANT: One generic signature for GetFormattedCounterValue to avoid argtypes clobbering
         self._get_fmt = self._pdh.PdhGetFormattedCounterValue
         self._get_fmt.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
         self._get_fmt.restype = wintypes.DWORD
 
-        # Expand wildcard paths
         self._expand = self._pdh.PdhExpandWildCardPathW
         self._expand.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
         self._expand.restype = wintypes.DWORD
@@ -119,21 +116,27 @@ class PdhCounters:
                 cands.append(prefix + path)
             return cands
 
-        # Add memory counters
         self._add_counter_multi("page_faults", both(r"\Memory\Page Faults/sec"), self._c_page_faults)
         self._add_counter_multi("pages_sec",   both(r"\Memory\Pages/sec"),      self._c_pages_sec)
         self._add_counter_multi("page_reads",  both(r"\Memory\Page Reads/sec"), self._c_page_reads)
-        self._add_counter_multi("comp_size",   both(r"\Memory\Compressed Page Size"), self._c_comp_size)
+
+        comp_candidates = []
+        for name in [
+            r"\Memory\Compressed Page Size",
+            r"\Memory\Compressed Bytes",
+            r"\Memory\System Compressed Bytes",
+        ]:
+            comp_candidates.extend(both(name))
+        self._add_counter_multi("comp_size", comp_candidates, self._c_comp_size)
+
         self._add_counter_multi("avail_bytes", both(r"\Memory\Available Bytes"), self._c_avail_bytes)
 
-        # Paging file % usage: wildcard expand actual instances
         pf_path = self._pick_paging_file_path(prefix)
         if pf_path:
             self._add_counter_multi("pf_usage", [pf_path], self._c_pf_usage)
         else:
             self._add_counter_multi("pf_usage", both(r"\Paging File(_Total)\% Usage"), self._c_pf_usage)
 
-        # Prime once
         try:
             self._collect(self._q)
             self._ok = True
@@ -226,8 +229,9 @@ class PdhCounters:
     def page_reads_per_sec(self) -> Optional[float]:
         return self._read_double(self._c_page_reads, "page_reads")
 
-    def compressed_page_size_bytes(self) -> Optional[int]:
-        return self._read_large(self._c_comp_size, "comp_size")
+    def compressed_bytes(self) -> Optional[int]:
+        # Compressed memory counters are usually LARGE (bytes).
+        return self._read_large(self._c_comp_size, "comp_bytes")
 
     def available_bytes(self) -> Optional[int]:
         return self._read_large(self._c_avail_bytes, "avail_bytes")
@@ -271,6 +275,69 @@ def safe_cpu_freq_percpu():
 def fmt_rate(x: Optional[float]) -> str:
     return "n/a" if x is None else f"{x:,.1f}"
 
+def _memcompression_rss_bytes() -> Optional[int]:
+    try:
+        for p in psutil.process_iter(attrs=["name"]):
+            name = (p.info.get("name") or "").lower()
+            if name in ("memcompression", "memcompression.exe"):
+                return int(p.memory_info().rss)
+    except Exception:
+        pass
+    return None
+
+# ---------------- Smoothing / derived signals ----------------
+class EMA:
+    """Simple EMA for 1Hz sampling."""
+    def __init__(self, alpha: float):
+        self.alpha = float(alpha)
+        self.v: Optional[float] = None
+
+    def update(self, x: Optional[float]) -> Optional[float]:
+        if x is None:
+            return self.v
+        if self.v is None:
+            self.v = float(x)
+        else:
+            self.v = self.alpha * float(x) + (1.0 - self.alpha) * self.v
+        return self.v
+
+def hardfault_label(page_reads_s: Optional[float], pages_s: Optional[float]) -> str:
+    """
+    Heuristic label for paging I/O pressure.
+    Tuned to be conservative and easy to interpret.
+    """
+    r = page_reads_s or 0.0
+    p = pages_s or 0.0
+
+    # Primary signal: reads/sec (disk-backed hard faults)
+    if r >= 100:
+        return "HOT"
+    if r >= 20:
+        return "WARN"
+
+    # Secondary: pages/sec (paging activity) if reads are low
+    if p >= 500:
+        return "WARN"
+    return "OK"
+
+def hardfault_index(page_reads_s: Optional[float], pages_s: Optional[float]) -> int:
+    """
+    0..100-ish score for quick at-a-glance. Not scientific; just a monotonic indicator.
+    Reads/sec dominates.
+    """
+    r = max(0.0, float(page_reads_s or 0.0))
+    p = max(0.0, float(pages_s or 0.0))
+
+    # Map reads/sec logarithmically (0..200 reads/sec -> 0..~80)
+    score_r = 0.0
+    if r > 0:
+        score_r = min(80.0, 20.0 * (math.log10(1.0 + r) / math.log10(1.0 + 200.0)) * 4.0)
+
+    # Pages/sec (0..2000 -> 0..20)
+    score_p = min(20.0, (p / 2000.0) * 20.0)
+
+    return int(round(min(100.0, score_r + score_p)))
+
 # ---------------- Process tops ----------------
 def prime_process_cpu_counters():
     for p in psutil.process_iter(attrs=["pid"]):
@@ -305,6 +372,11 @@ def draw_monitor():
     pdh = PdhCounters()
     prime_process_cpu_counters()
 
+    # EMA ~10s with 1Hz sampling => alpha ~ 2/(N+1)
+    ema_pf = EMA(alpha=2.0 / (10.0 + 1.0))
+    ema_pages = EMA(alpha=2.0 / (10.0 + 1.0))
+    ema_reads = EMA(alpha=2.0 / (10.0 + 1.0))
+
     try:
         while True:
             prime_process_cpu_counters()
@@ -321,9 +393,21 @@ def draw_monitor():
             pf_s = pdh.page_faults_per_sec() if pdh.ok else None
             pages_s = pdh.pages_per_sec() if pdh.ok else None
             preads_s = pdh.page_reads_per_sec() if pdh.ok else None
-            comp_bytes = pdh.compressed_page_size_bytes() if pdh.ok else None
+
+            pf_ema = ema_pf.update(pf_s)
+            pages_ema = ema_pages.update(pages_s)
+            reads_ema = ema_reads.update(preads_s)
+
+            comp_bytes = pdh.compressed_bytes() if pdh.ok else None
+            comp_proxy = None
+            if comp_bytes is None:
+                comp_proxy = _memcompression_rss_bytes()
+
             avail_bytes = pdh.available_bytes() if pdh.ok else None
             pf_usage = pdh.paging_file_percent_usage() if pdh.ok else None
+
+            hf_label = hardfault_label(preads_s, pages_s)
+            hf_index = hardfault_index(preads_s, pages_s)
 
             perf = get_perf_info()
             pg = perf.PageSize
@@ -358,14 +442,28 @@ def draw_monitor():
                     else:
                         print(f"CPU SPEED:     {format_freq_mhz(cur_avg)} avg")
 
+            if comp_bytes is not None:
+                comp_str = format_bytes(float(comp_bytes))
+            elif comp_proxy is not None:
+                comp_str = f"{format_bytes(float(comp_proxy))} (MemCompression RSS)"
+            else:
+                comp_str = "n/a"
+
+            # Pressure line + 10s EMA trend
             print(
                 "MEM PRESSURE:  "
-                f"Page Faults/sec: {fmt_rate(pf_s)} | Pages/sec: {fmt_rate(pages_s)} | Page Reads/sec: {fmt_rate(preads_s)} | "
-                f"Compressed: {('n/a' if comp_bytes is None else format_bytes(float(comp_bytes)))}"
+                f"PF/s: {fmt_rate(pf_s)} (EMA10 {fmt_rate(pf_ema)}) | "
+                f"Pages/s: {fmt_rate(pages_s)} (EMA10 {fmt_rate(pages_ema)}) | "
+                f"Reads/s: {fmt_rate(preads_s)} (EMA10 {fmt_rate(reads_ema)}) | "
+                f"Compressed: {comp_str}"
+            )
+            print(
+                "PAGING HEALTH: "
+                f"HardFaultPressure: {hf_label:<4} | Index: {hf_index:>3}/100"
             )
             print(
                 "MEM AVAIL:     "
-                f"Avail Bytes: {('n/a' if avail_bytes is None else format_bytes(float(avail_bytes)))} | "
+                f"Avail: {('n/a' if avail_bytes is None else format_bytes(float(avail_bytes)))} | "
                 f"PagingFile %Usage: {('n/a' if pf_usage is None else f'{pf_usage:,.1f}%')}"
             )
 
