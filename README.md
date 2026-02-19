@@ -1,164 +1,157 @@
-# Ultimate Robust Monitor (Windows)
+# Windows Kernel Monitor (Admin-Friendly) — Native Python
 
-A lightweight Windows terminal dashboard that displays **CPU + deep memory + kernel + system counters** in real time.
+A **single-file**, **no-GUI** Windows performance monitor that prints a high-signal terminal dashboard with **CPU**, **memory pressure**, **pagefile**, **kernel memory**, and **top process** stats. Designed to be **robust on real Windows boxes** (including mixed PDH availability) and **safe to run continuously**.
 
-File: `native_win_monitor_v2.py`
+> **Run as Administrator (recommended / some environments).**  
+> Some counters and process details may be limited without elevated privileges.
 
 ---
 
-## What it shows
+## Features
 
 ### CPU
-- **Logical cores / Physical cores**
-- **Overall CPU** utilization bar + percentage
-- **Per-core utilization** in a **2-column grid**
+- **Overall CPU utilization** (%)
+- **Per-core utilization** (%)
+- **CPU frequency**
+  - Average current frequency across cores (from `psutil`)
+  - Per-core current/max frequency and % of max (when available)
 
-### Deep memory + kernel/system blocks (via Windows `GetPerformanceInfo`)
-All memory numbers come from the Windows API and are scaled by `PageSize`.
+### Memory pressure (PDH)
+- **Page Faults/sec** (`\Memory\Page Faults/sec`)
+- **Pages/sec** (`\Memory\Pages/sec`)
+- **Page Reads/sec** (`\Memory\Page Reads/sec`)
+- **Compressed Page Size** (`\Memory\Compressed Page Size`)  
+  (Windows Memory Compression footprint, shown as bytes/MB/GB)
 
-- **Physical Total**: total RAM usable by the OS
-- **Physical Available**: RAM immediately available for allocation
-- **Commit Total**: current committed virtual memory (“commit charge”)
-- **Commit Limit**: max commit (RAM + pagefile)
-- **Kernel Paged**: kernel memory that can be paged out
-- **Kernel Non-Paged**: kernel memory that cannot be paged out
+### Memory availability & pagefile (PDH)
+- **Memory\Available Bytes** (`\Memory\Available Bytes`)
+- **Paging File(_Total)\% Usage** (resolved via wildcard expansion when needed)
 
-### System counters
-- **Handles**
-- **Processes**
-- **Threads**
+### Deep kernel/system memory (GetPerformanceInfo)
+- **Physical Total / Available**
+- **Commit Total / Commit Limit**
+- **Kernel Paged** (swappable)
+- **Kernel Non-Paged** (resident)
 
-### Refresh behavior
-- Updates about once per second (CPU sampling uses a 1s interval)
-- Stop with **Ctrl+C**
+### Swap / pagefile (psutil)
+- **Swap Total / Used / Free / %** (Windows pagefile exposure via `psutil.swap_memory()`)
+
+### Top processes
+- **Top by CPU%** (last ~1s window)
+- **Top by RSS (Working Set)** with % of system memory
+
+### System totals
+- **Handles**, **Processes**, **Threads** (from `GetPerformanceInfo`)
+
+---
+
+## Screenshot
+
+The dashboard is a terminal output updated about once per second, e.g.:
+
+- CPU bars (overall + per-core)
+- Memory pressure counters (page faults/pages/page reads)
+- Memory compression size
+- Paging file usage + available bytes
+- Deep kernel memory + swap/pagefile details
+- Top processes by CPU + memory
 
 ---
 
 ## Requirements
 
-- Windows 10/11 (or Windows Server)
-- Python 3.9+ recommended
-- `psutil`
+- **Windows 10/11**
+- **Python 3.9+** recommended (3.8+ usually OK)
+- `psutil` (only external dependency)
+
+> PDH is part of Windows. The script uses `ctypes` to call PDH + kernel APIs directly.
 
 ---
 
-## Install
+## Installation
 
-### 1) Install Python
-Install Python from python.org and ensure **“Add Python to PATH”** is checked.
-
-Verify:
+### Option A — pip install dependency
 ```powershell
-python --version
+python -m pip install --upgrade pip
+python -m pip install psutil
 ```
 
-### 2) (Recommended) Create and activate a virtual environment
-From the repo folder:
+### Option B — venv (recommended)
 ```powershell
 python -m venv .venv
-.venv\Scripts\activate
-```
-
-### 3) Install dependencies
-```powershell
-pip install --upgrade pip
-pip install psutil
+. .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install psutil
 ```
 
 ---
 
-## Run
+## Usage
 
-### Run (standard)
+### Run (recommended: elevated shell)
+Open **PowerShell as Administrator** (recommended / some environments) and run:
+
 ```powershell
-python native_win_monitor_v2.py
+python .\native_win_monitor_v12.py
 ```
 
----
-
-## Run as Administrator (recommended / some environments)
-
-Some Windows environments restrict access to certain system counters unless elevated, or you may want consistent access when running under strict enterprise policies.
-
-### Option A (recommended): Start your terminal as Admin
-1. Start Menu → search **Windows Terminal** (or **PowerShell**)
-2. Right-click → **Run as administrator**
-3. `cd` into the repo folder
-4. Run:
-```powershell
-python native_win_monitor_v2.py
-```
-
-### Option B: Launch an Admin PowerShell from your current terminal
-```powershell
-Start-Process powershell -Verb RunAs -ArgumentList "cd '$PWD'; python native_win_monitor_v2.py"
-```
-
----
-
-## Output layout (what you’ll see)
-
-- Header:
-  - `ULTIMATE ROBUST MONITOR | CORES: <physical>P / <logical>L`
-- CPU:
-  - Overall CPU bar `[█████...] xx.x%`
-  - Per-core grid in two columns:
-    - `Core 00: [■■■■      ]  40.0% | Core 08: [■■■       ]  30.0%`
-- Deep memory blocks:
-  - Physical + Commit + Kernel paged/non-paged
-- System counters:
-  - Handles | Processes | Threads
-- Footer:
-  - `Press Ctrl+C to stop.`
-
----
-
-## How it works (implementation notes)
-
-- CPU:
-  - Uses `psutil.cpu_count()` and `psutil.cpu_count(logical=False)`
-  - Uses `psutil.cpu_percent(interval=1, percpu=True)` for per-core utilization  
-    (the 1-second interval sets the refresh cadence)
-
-- Memory/kernel/system counters:
-  - Uses `ctypes.windll.psapi.GetPerformanceInfo(...)`
-  - Reads fields from the `PERFORMANCE_INFORMATION` struct
-  - Converts page counts to bytes using `PageSize`
-  - Formats values into B/KB/MB/GB/TB
-
-- Screen refresh:
-  - Clears terminal with `cls` on Windows before redraw
+Stop with:
+- `Ctrl + C`
 
 ---
 
 ## Troubleshooting
 
-### `ModuleNotFoundError: No module named 'psutil'`
+### 1) Some values show `n/a`
+That usually means:
+- A PDH counter could not be bound on this system, or
+- You are not running with enough privileges, or
+- That metric is not exposed by your Windows build / perf counter set.
+
+Try running as Administrator and/or enable PDH debug:
+
 ```powershell
-pip install psutil
+$env:DEBUG_PDH="1"
+python .\native_win_monitor_v12.py
 ```
 
-### Output looks misaligned
-- Use a monospace terminal (Windows Terminal recommended)
-- Increase terminal width (the dashboard assumes ~65+ columns)
+This prints which exact PDH counter paths were chosen and PDH status codes.
 
-### Permission / access issues
-- Run the terminal **as Administrator** (see above)
+### 2) PDH counter path quirks
+Different Windows builds sometimes require the machine-qualified path:
+- `\\COMPUTERNAME\Memory\Page Faults/sec`
+
+The script automatically tries both local and machine-qualified forms when applicable.
+
+### 3) Per-core CPU frequency shows `n/a` for some cores
+On some systems (especially hybrid CPU topologies / driver combinations), Windows or `psutil` may not expose per-core frequency for every logical core. The monitor will still show overall CPU utilization correctly.
+
+---
+
+## What each metric means (quick guide)
+
+- **Page Faults/sec**: total page faults (soft + hard) per second. Spikes can be normal; sustained high values may indicate memory pressure or heavy paging activity.
+- **Pages/sec**: pages read/written to resolve hard faults; often correlates with paging I/O pressure.
+- **Page Reads/sec**: reads from disk to resolve hard faults (more directly I/O-related).
+- **Compressed Page Size**: amount of memory occupied by Windows’ memory compression store.
+- **Available Bytes**: immediately available physical memory for allocation.
+- **Paging File % Usage**: percent usage of the pagefile (instance resolved to `_Total` if present).
+- **Commit Total / Limit**: committed virtual memory vs commit limit (RAM + pagefile).
+- **Kernel Paged / Non-Paged**: kernel memory that can/cannot be paged out.
+
+---
+
+## Files
+
+- `native_win_monitor_v12.py` — main monitor script
 
 ---
 
 ## License
 
-### Recommended: MIT License
-If you want a permissive license, MIT is a common choice.
-
-1) Create a file named `LICENSE` in the repo root  
-2) Paste the following text and update the year + name:
-
-```
 MIT License
 
-Copyright (c) 2026 <YOUR NAME>
+Copyright (c) 2026
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -177,6 +170,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-```
-
-If you prefer **Apache-2.0** or **GPLv3**, swap this section accordingly.
