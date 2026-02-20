@@ -1,138 +1,165 @@
-# Windows Kernel Monitor (Admin-Friendly) — Native Python
+# Windows Kernel Monitor (Native) — Ultimate Robust Monitor
 
-A **single-file**, **no-GUI** Windows performance monitor that prints a high-signal terminal dashboard with **CPU**, **memory pressure**, **paging health**, **pagefile**, **kernel memory**, and **top process** stats.
+A single-file, dependency-light Windows monitoring tool (Python) focused on **real-time CPU + memory + kernel + paging** visibility, with an **optional GPU block** (via Windows Performance Counters).
 
-> **Run as Administrator (recommended / some environments).**  
-> Some counters and process details may be limited without elevated privileges.
-
----
-
-## What’s new (v14)
-
-- **EMA smoothing (10s)** for key memory pressure counters:
-  - Page Faults/sec, Pages/sec, Page Reads/sec
-- **Paging Health line** with:
-  - `HardFaultPressure: OK/WARN/HOT` (heuristic label)
-  - `Index: 0–100` (monotonic “hard-fault pressure” indicator)
-- **Compressed memory robustness**
-  - Tries several PDH compressed-bytes counters
-  - Falls back to **MemCompression RSS** (working set) if PDH counter isn’t available
+This is designed to be run in a terminal and refreshed continuously (like a lightweight `top` for Windows, but with paging + kernel memory focus).
 
 ---
 
 ## Features
 
 ### CPU
-- Overall CPU utilization (%)
-- Per-core utilization (%)
-- CPU frequency (avg + per-core current/max when available)
+- Overall CPU utilization (rolling)
+- **Per-core utilization**
+- **Per-core effective clock** (GHz) and normalized speed (% of max observed)
+- Detects and displays core counts and hybrid/core labeling when available
 
-### Memory pressure (PDH)
-- **Page Faults/sec**
-- **Pages/sec**
-- **Page Reads/sec**
-- Each shown as: **instant** + **EMA10** (10-second exponential moving average)
-
-### Paging health (derived)
-A quick interpretation layer for “are we actually paging to disk?”:
-
-- **HardFaultPressure**:
-  - `OK` — low disk-backed paging
-  - `WARN` — noticeable paging I/O
-  - `HOT` — sustained high paging I/O
-- **Index (0–100)**:
-  - dominated by Page Reads/sec, with a smaller contribution from Pages/sec
-
-> This is a heuristic meant to be **useful**, not “scientific”.
-
-### Memory compression (PDH + fallback)
-- If available: PDH compressed-bytes counter
-- Otherwise: **MemCompression process RSS** shown as:
-  - `Compressed: X (MemCompression RSS)`
-
-### Memory availability & pagefile (PDH)
-- Memory\\Available Bytes
-- Paging File(*)\\% Usage (instance resolved via wildcard expansion, prefers `_Total`)
-
-### Deep kernel/system memory (GetPerformanceInfo)
+### Memory (Deep)
 - Physical Total / Available
 - Commit Total / Commit Limit
-- Kernel Paged / Kernel Non-Paged
-- Handles / Processes / Threads
+- Kernel **Paged** and **Non-Paged** pool
+- Swap/Pagefile total/used/free (via `psutil`)
 
-### Swap / pagefile (psutil)
-- Swap Total / Used / Free / %
+### Paging / Memory Pressure (PDH)
+- **Page Faults/sec** (PF/s) + EMA smoothing
+- **Pages/sec** + EMA smoothing
+- **Page Reads/sec** + EMA smoothing
+- **PagingFile(*) % Usage**
+- **Memory\Available Bytes**
+- Derived **HardFaultPressure index** (0–100) and qualitative label (OK/WARN/HOT)
 
-### Top processes
-- Top by CPU% (last ~1s)
-- Top by RSS (working set) + % of system memory
+### Memory Compression
+- “Compressed” memory estimate using the **MemCompression** process RSS (working set)
+
+### Processes
+- Top processes by CPU%
+- Top processes by RSS (working set)
+- Handles / processes / threads totals
+
+### GPU (Windows PDH — NEW)
+- Overall GPU utilization (aggregated from GPU engine counters)
+- Per-engine breakdown (top engine categories), typically:
+  - `3D`, `Copy`, `Compute`, `VideoDecode`, `VideoEncode` (others may appear depending on driver)
+- GPU adapter memory usage:
+  - Dedicated usage
+  - Shared usage
+
+Example GPU line:
+```
+GPU: Util: 2.6% | Engines: 3D:2.6% | Copy:0.2% | ... | Mem: Dedicated 853.36 MB | Shared 661.43 MB
+```
 
 ---
 
 ## Requirements
 
 - Windows 10/11
-- Python 3.9+ recommended (3.8+ usually OK)
-- `psutil` (only external dependency)
+- Python 3.9+ recommended (3.8+ typically OK)
+- No Visual Studio / compilation required
 
----
-
-## Install
-
+### Python dependencies
+Install:
 ```powershell
 python -m pip install --upgrade pip
 python -m pip install psutil
 ```
 
+*(Everything else is standard library: `ctypes`, `time`, `datetime`, etc.)*
+
 ---
 
 ## Run
 
-Open **PowerShell as Administrator** (recommended / some environments) and run:
-
+### Basic
 ```powershell
-python .\native_win_monitor_v14.py
+python .\native_win_monitor_v29.py
 ```
 
-Stop: `Ctrl + C`
+### Run as Administrator (recommended / some environments)
+Some counters or process visibility can be restricted on certain systems. If you see `Access is denied` or missing counters, run PowerShell or Windows Terminal **as Administrator**:
+```powershell
+python .\native_win_monitor_v29.py
+```
+
+Stop anytime with **Ctrl+C**.
 
 ---
 
-## Debug PDH counters
+## Output Notes / Interpretation
 
-If some PDH values show `n/a`:
+### Page Faults/sec vs Pages/sec vs Page Reads/sec
+- **Page Faults/sec** includes *soft faults* and *hard faults* (not all are disk I/O).
+- **Pages/sec** is a stronger indicator of paging activity (potentially hard faults).
+- **Page Reads/sec** indicates paging reads from disk and is often the most “painful” when elevated.
 
+### HardFaultPressure Index
+A simple heuristic derived from `Page Reads/sec` and `Pages/sec`:
+- **OK**: low paging pressure
+- **WARN**: noticeable paging activity
+- **HOT**: sustained hard faults / disk reads likely impacting responsiveness
+
+### Memory Compression
+Windows memory compression isn’t always exposed as a clean global counter. This tool estimates it using the **MemCompression** process working set.
+
+### GPU Block
+GPU values come from Windows Performance Counters:
+- `\GPU Engine(*)\Utilization Percentage`
+- `\GPU Adapter Memory(*)\Dedicated Usage`
+- `\GPU Adapter Memory(*)\Shared Usage`
+
+Some drivers expose extra engine categories (e.g., `Security`, `High`). That’s normal.
+
+---
+
+## Troubleshooting
+
+### “n/a” for some PDH counters
+Some counters may be missing or named differently on certain Windows builds/locales. The tool already tries multiple counter path variants.
+
+### Verify counters exist with `typeperf`
+Examples:
 ```powershell
-$env:DEBUG_PDH="1"
-python .\native_win_monitor_v14.py
+typeperf "\Memory\Page Faults/sec" -sc 3
+typeperf "\Memory\Pages/sec" -sc 3
+typeperf "\Memory\Page Reads/sec" -sc 3
+typeperf "\Paging File(*)\% Usage" -sc 3
+typeperf "\Memory\Available Bytes" -sc 3
+typeperf "\GPU Engine(*)\Utilization Percentage" -sc 3
+typeperf "\GPU Adapter Memory(*)\Shared Usage" -sc 3
 ```
 
-This prints:
-- which exact PDH counter paths were chosen
-- PDH status codes for reads
+### Missing GPU counters
+Some systems (or drivers) may not expose GPU Engine counters. Task Manager may still show GPU usage even if counters are missing.
+
+### Permission issues
+Run PowerShell/Terminal **as Administrator** (recommended / some environments).
+
+---
+
+## Repository Layout (suggested)
+
+```
+windows-kernel-monitor/
+  native_win_monitor_v29.py
+  README.md
+  LICENSE
+```
+
+If you prefer the canonical filename to stay `native_win_monitor.py`, rename:
+```powershell
+Rename-Item .\native_win_monitor_v29.py native_win_monitor.py
+```
 
 ---
 
 ## License
 
-MIT License (see below)
+MIT License. See `LICENSE`.
 
-Copyright (c) 2026
+---
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+## Contributing
+PRs welcome. If you’re adding new counters:
+- Prefer **PDH** counters when available (portable and scriptable)
+- Keep the terminal output stable and readable (avoid overly wide lines)
+- Add a `typeperf` verification line to this README when introducing new counters

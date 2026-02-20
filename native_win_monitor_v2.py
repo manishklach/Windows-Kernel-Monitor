@@ -4,6 +4,16 @@ from ctypes import wintypes
 import os
 from typing import Optional, Dict, List, Tuple
 import math
+import re
+
+
+def _machine_prefix() -> str:
+    """Return machine prefix for localized PDH paths (e.g., \\HOSTNAME)."""
+    try:
+        host = os.environ.get("COMPUTERNAME", "").strip()
+        return f"\\\\{host}" if host else ""
+    except Exception:
+        return ""
 
 ULONG_PTR = getattr(wintypes, "ULONG_PTR", ctypes.c_void_p)
 DEBUG_PDH = os.environ.get("DEBUG_PDH", "").strip().lower() in ("1", "true", "yes")
@@ -320,6 +330,182 @@ def hardfault_label(page_reads_s: Optional[float], pages_s: Optional[float]) -> 
         return "WARN"
     return "OK"
 
+
+class GpuPdh:
+    """Minimal PDH wrapper for GPU Engine utilization + GPU Adapter Memory usage."""
+
+    def __init__(self):
+        self.ok = False
+        self._q = wintypes.HANDLE()
+        self._engine = []  # list of (path, handle)
+        self._ded = []
+        self._shr = []
+        try:
+            self._pdh = ctypes.WinDLL("pdh.dll")
+        except Exception:
+            return
+
+        self._open = self._pdh.PdhOpenQueryW
+        self._open.argtypes = [wintypes.LPCWSTR, ULONG_PTR, ctypes.POINTER(wintypes.HANDLE)]
+        self._open.restype = wintypes.DWORD
+
+        self._add = self._pdh.PdhAddCounterW
+        self._add.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, ULONG_PTR, ctypes.POINTER(wintypes.HANDLE)]
+        self._add.restype = wintypes.DWORD
+
+        self._collect = self._pdh.PdhCollectQueryData
+        self._collect.argtypes = [wintypes.HANDLE]
+        self._collect.restype = wintypes.DWORD
+
+        self._close = self._pdh.PdhCloseQuery
+        self._close.argtypes = [wintypes.HANDLE]
+        self._close.restype = wintypes.DWORD
+
+        self._expand = self._pdh.PdhExpandWildCardPathW
+        self._expand.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.DWORD,
+        ]
+        self._expand.restype = wintypes.DWORD
+
+        self._getfmt = self._pdh.PdhGetFormattedCounterValue
+        self._getfmt.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        self._getfmt.restype = wintypes.DWORD
+
+        st = self._open(None, 0, ctypes.byref(self._q))
+        if st != 0:
+            return
+
+        prefix = _machine_prefix()
+
+        def expand(pat: str):
+            size = wintypes.DWORD(0)
+            st1 = self._expand(None, pat, None, ctypes.byref(size), 0)
+            if st1 not in (PDH_MORE_DATA, 0) or size.value == 0:
+                return []
+            buf = ctypes.create_unicode_buffer(size.value)
+            st2 = self._expand(None, pat, buf, ctypes.byref(size), 0)
+            if st2 != 0:
+                return []
+            return [s for s in buf[:].split("\x00") if s]
+
+        def add_many(paths):
+            out = []
+            for p in paths:
+                h = wintypes.HANDLE()
+                stc = self._add(self._q, p, 0, ctypes.byref(h))
+                if stc == 0:
+                    out.append((p, h))
+            return out
+
+        engine_paths = []
+        for pat in [r"\GPU Engine(*)\Utilization Percentage", (prefix + r"\GPU Engine(*)\Utilization Percentage") if prefix else None]:
+            if pat:
+                engine_paths.extend(expand(pat))
+        self._engine = add_many(engine_paths)
+
+        ded_paths = []
+        for pat in [r"\GPU Adapter Memory(*)\Dedicated Usage", (prefix + r"\GPU Adapter Memory(*)\Dedicated Usage") if prefix else None]:
+            if pat:
+                ded_paths.extend(expand(pat))
+        self._ded = add_many(ded_paths)
+
+        shr_paths = []
+        for pat in [r"\GPU Adapter Memory(*)\Shared Usage", (prefix + r"\GPU Adapter Memory(*)\Shared Usage") if prefix else None]:
+            if pat:
+                shr_paths.extend(expand(pat))
+        self._shr = add_many(shr_paths)
+
+        try:
+            self._collect(self._q)
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def close(self):
+        try:
+            if self._q:
+                self._close(self._q)
+        except Exception:
+            pass
+
+    def _read_double(self, h):
+        val = PDH_FMT_COUNTERVALUE()
+        typ = wintypes.DWORD(0)
+        st = self._getfmt(h, PDH_FMT_DOUBLE, ctypes.byref(typ), ctypes.byref(val))
+        if st != 0:
+            return None
+        return float(val.doubleValue)
+
+    def _read_large(self, h):
+        val = PDH_FMT_COUNTERVALUE_LARGE()
+        typ = wintypes.DWORD(0)
+        st = self._getfmt(h, PDH_FMT_LARGE, ctypes.byref(typ), ctypes.byref(val))
+        if st != 0:
+            return None
+        return int(val.largeValue)
+
+    def sample(self):
+        if not self.ok:
+            return None
+        try:
+            self._collect(self._q)
+        except Exception:
+            return None
+
+        utils = []
+        for p, h in self._engine:
+            v = self._read_double(h)
+            if v is not None:
+                utils.append((p, v))
+
+        ded = 0
+        gotd = False
+        for p, h in self._ded:
+            v = self._read_large(h)
+            if v is not None:
+                ded += v
+                gotd = True
+
+        shr = 0
+        gots = False
+        for p, h in self._shr:
+            v = self._read_large(h)
+            if v is not None:
+                shr += v
+                gots = True
+
+        overall, top = aggregate_gpu_engines(utils) if utils else (None, [])
+        return {"overall": overall, "top": top, "ded": (ded if gotd else None), "shr": (shr if gots else None)}
+
+
+def _gpu_engine_type_from_path(path: str) -> str:
+    m = re.search(r"engtype_([A-Za-z0-9]+)", path)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\\GPU Engine\\\((.*?)\\\)\\Utilization Percentage", path)
+    if m2:
+        inst = m2.group(1)
+        for tok in ["3D", "Copy", "Compute", "VideoDecode", "VideoEncode"]:
+            if tok.lower() in inst.lower():
+                return tok
+        return inst[-20:]
+    return "GPU"
+
+def aggregate_gpu_engines(utils: List[Tuple[str, float]]) -> Tuple[Optional[float], List[Tuple[str, float]]]:
+    if not utils:
+        return None, []
+    by_type: Dict[str, float] = {}
+    for path, val in utils:
+        t = _gpu_engine_type_from_path(path)
+        by_type[t] = max(by_type.get(t, 0.0), float(val))
+    overall = max(by_type.values()) if by_type else None
+    top = sorted(by_type.items(), key=lambda kv: kv[1], reverse=True)
+    return overall, top[:4]
+
 def hardfault_index(page_reads_s: Optional[float], pages_s: Optional[float]) -> int:
     """
     0..100-ish score for quick at-a-glance. Not scientific; just a monotonic indicator.
@@ -370,6 +556,7 @@ def draw_monitor():
     physical_cores = psutil.cpu_count(logical=False) or 0
 
     pdh = PdhCounters()
+    gpu = GpuPdh()
     prime_process_cpu_counters()
 
     # EMA ~10s with 1Hz sampling => alpha ~ 2/(N+1)
@@ -466,6 +653,23 @@ def draw_monitor():
                 f"Avail: {('n/a' if avail_bytes is None else format_bytes(float(avail_bytes)))} | "
                 f"PagingFile %Usage: {('n/a' if pf_usage is None else f'{pf_usage:,.1f}%')}"
             )
+            gpu_sample = gpu.sample() if (gpu and gpu.ok) else None
+            if gpu_sample:
+                types_str = " | ".join([f"{t}:{v:,.1f}%" for t, v in gpu_sample["top"]]) if gpu_sample["top"] else "n/a"
+                mem_parts = []
+                if gpu_sample["ded"] is not None:
+                    mem_parts.append(f"Dedicated {format_bytes(float(gpu_sample['ded']))}")
+                if gpu_sample["shr"] is not None:
+                    mem_parts.append(f"Shared {format_bytes(float(gpu_sample['shr']))}")
+                mem_str = " | ".join(mem_parts) if mem_parts else "n/a"
+                overall_str = "n/a" if gpu_sample["overall"] is None else f"{gpu_sample['overall']:,.1f}%"
+                print(
+                    "GPU:           "
+                    f"Util: {overall_str} | "
+                    f"Engines: {types_str} | "
+                    f"Mem: {mem_str}"
+                )
+
 
             if DEBUG_PDH and pdh.ok:
                 print("\n[PDH DEBUG] chosen paths:")
